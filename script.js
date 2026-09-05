@@ -27,6 +27,8 @@ const SAVED_ORDERS_KEY = "savedOrders";
 const SAVED_ORDERS_LIMIT = 10;
 const ORDER_DRAFT_KEY = "tomatoOrderDraft";
 const PENDING_ORDER_REQUEST_KEY = "tomatoPendingOrderRequest";
+const CART_REMOVALS_KEY = "tomatoCartRemovalsV1";
+let rejectedOrderItems = [];
 const RESET_VERSION_KEY = "tomatoResetVersion";
 const RESET_DATE = new Date("2027-06-01T00:00:00+03:00").getTime();
 const RESET_VERSION = "2027-06-01";
@@ -41,6 +43,7 @@ function runScheduledStorageReset(now = Date.now()) {
     ORDER_DRAFT_KEY,
     "pendingSheet",
     PENDING_ORDER_REQUEST_KEY,
+    CART_REMOVALS_KEY,
   ].forEach((key) => localStorage.removeItem(key));
 
   localStorage.setItem(RESET_VERSION_KEY, RESET_VERSION);
@@ -366,6 +369,20 @@ function clearClientRequestId(requestId) {
     localStorage.removeItem(PENDING_ORDER_REQUEST_KEY);
   }
 }
+
+function commitConfirmedOrderCart(currentCart, submittedItems, requestId) {
+  const remaining = currentCart.map((item) => {
+    const sent = submittedItems.find((entry) => String(entry.id) === String(item.id));
+    return { ...item, qty: Math.max(0, item.qty - (sent ? sent.qty : 0)) };
+  }).filter((item) => item.qty > 0);
+
+  // Persist the cart before dropping the retry ID, never in an animation timer.
+  // If storage fails, keep the pending request available for recovery.
+  if (remaining.length) localStorage.setItem("tomatoCart", JSON.stringify(remaining));
+  else localStorage.removeItem("tomatoCart");
+  clearClientRequestId(requestId);
+  return remaining;
+}
 function getClientLookupUrl(phone, requestTime = Date.now()) {
   return (
     CATALOG_API_URL +
@@ -412,6 +429,17 @@ async function sendOrderWithRecovery(payload, onRecovery) {
     onRecovery();
     return await fetchJsonWithTimeout(CATALOG_API_URL, options, ORDER_SUBMIT_REQUEST_TIMEOUT);
   }
+}
+
+function getOrderResultError(result) {
+  if (result && result.success && result.orderId) return null;
+  const error = new Error(result?.error || "Сервер не вернул номер заказа");
+  if (result?.success === false && result.writeState === "not_written") {
+    error.code = "ORDER_NOT_WRITTEN";
+    error.unavailableItems = Array.isArray(result.unavailableItems)
+      ? result.unavailableItems.filter(item => item && typeof item.id === "string") : [];
+  }
+  return error;
 }
 
 function readCatalogCache(allowExpired = false) {
@@ -843,7 +871,57 @@ function getCatalogSignature(list) {
   );
 }
 
+let cartRemovalNotices = readCartRemovalNotices();
+
+function readCartRemovalNotices() {
+  try {
+    const value = JSON.parse(localStorage.getItem(CART_REMOVALS_KEY) || "[]");
+    return Array.isArray(value)
+      ? [...new Set(value.filter((name) => typeof name === "string" && name.trim()))]
+      : [];
+  } catch {
+    return [];
+  }
+}
+
+function renderCartRemovalNotice() {
+  const banner = document.getElementById("cartRemovalNotice");
+  const list = document.getElementById("cartRemovalList");
+  if (!banner || !list) return;
+  list.replaceChildren();
+  cartRemovalNotices.forEach((name) => {
+    const item = document.createElement("li");
+    item.textContent = name;
+    list.appendChild(item);
+  });
+  banner.hidden = cartRemovalNotices.length === 0;
+}
+
+function rememberCartRemovals(names) {
+  if (!names.length) return;
+  cartRemovalNotices = [...new Set([...cartRemovalNotices, ...names])];
+  try {
+    localStorage.setItem(CART_REMOVALS_KEY, JSON.stringify(cartRemovalNotices));
+  } catch (error) {
+    console.warn("Уведомление корзины сохранено только до закрытия страницы", error);
+  }
+  renderCartRemovalNotice();
+}
+
+document.getElementById("dismissCartRemovalNotice")?.addEventListener("click", () => {
+  cartRemovalNotices = [];
+  try {
+    localStorage.removeItem(CART_REMOVALS_KEY);
+  } catch (error) {
+    console.warn("Не удалось сохранить закрытие уведомления корзины", error);
+  }
+  renderCartRemovalNotice();
+});
+renderCartRemovalNotice();
+
 function syncCartWithCatalog(nextProducts) {
+  // Do not alter an in-flight/uncertain submission based on newer stock data.
+  if (readPendingOrderRequest() || rejectedOrderItems.length) return { removed: [], priceChanges: [] };
   const freshById = new Map(
     nextProducts.map((product) => [String(product.id), product]),
   );
@@ -877,6 +955,7 @@ function syncCartWithCatalog(nextProducts) {
     ];
   });
 
+  rememberCartRemovals(removed);
   updateCart();
   return { removed, priceChanges };
 }
@@ -1757,6 +1836,8 @@ async function submitOrder(options = {}) {
   const orderSubmitError = document.getElementById("orderSubmitError");
 
   if (orderSubmitError) orderSubmitError.hidden = true;
+  document.getElementById("removeUnavailableOrderItems").hidden = true;
+  rejectedOrderItems = [];
 
   const nameInput = document.getElementById("clientName");
 
@@ -1886,13 +1967,8 @@ document.body.appendChild(blocker);
         throw seasonError;
       }
 
-      if (!result || !result.success || !result.orderId) {
-        throw new Error(
-          result && result.error
-            ? String(result.error)
-            : "Сервер не вернул номер заказа",
-        );
-      }
+      const resultError = getOrderResultError(result);
+      if (resultError) throw resultError;
 
       if (result.mode === "addon" || result.mode === "normal") {
         orderMode = result.mode;
@@ -2024,13 +2100,14 @@ document.body.appendChild(blocker);
         })
         .join("");
 
+      cart = commitConfirmedOrderCart(cart, submittedItems, clientRequestId);
+
       btn.innerHTML = `
   <div class="success-check">
     ✓
   </div>
 `;
       navigator.vibrate?.([80, 50, 80]);
-      clearClientRequestId(clientRequestId);
       setTimeout(() => {
         document.getElementById("loadingBlocker")?.remove();
 
@@ -2046,15 +2123,7 @@ document.body.appendChild(blocker);
 
         lockBody();
 
-        // Preserve any other products added while confirmation was pending.
-        cart = cart.map((item) => {
-          const sent = submittedItems.find((entry) => String(entry.id) === String(item.id));
-          return { ...item, qty: Math.max(0, item.qty - (sent ? sent.qty : 0)) };
-        }).filter((item) => item.qty > 0);
-
         updateCart();
-
-       if (!cart.length) localStorage.removeItem("tomatoCart");
 
         savedSheetMode = false;
         document.getElementById("savedSheetActions").hidden = true;
@@ -2132,6 +2201,20 @@ document.body.appendChild(blocker);
       btn.classList.remove("loading-btn");
       btn.disabled = false;
       btn.removeAttribute("aria-busy");
+      if (err && err.code === "ORDER_NOT_WRITTEN") {
+        clearClientRequestId(clientRequestId);
+        foundClient = null;
+        setCheckoutIdentityFieldsVisible(true);
+        nameInput.value = name;
+        phoneInput.value = phone;
+        btn.textContent = "Создать заказ";
+        orderSubmitError.textContent = "Заказ не записан. " + err.message + ". Исправьте состав или данные и отправьте снова.";
+        orderSubmitError.hidden = false;
+        rejectedOrderItems = err.unavailableItems || [];
+        document.getElementById("removeUnavailableOrderItems").hidden = !rejectedOrderItems.length;
+        showToast("Заказ не записан. Проверьте сообщение в форме оформления.");
+        return;
+      }
       btn.textContent = "Проверить отправку";
 
       if (orderSubmitError) {
@@ -2467,6 +2550,20 @@ let orderLabel = "";
 
 let orderSending = false;
 
+document.getElementById("removeUnavailableOrderItems").addEventListener("click", () => {
+  if (orderSending || readPendingOrderRequest()) return;
+  const ids = new Set(rejectedOrderItems.map(item => item.id));
+  const removed = cart.filter(item => ids.has(String(item.id))).map(item => String(item.title || item.id));
+  cart = cart.filter(item => !ids.has(String(item.id)));
+  rememberCartRemovals(removed);
+  updateCart();
+  rejectedOrderItems = [];
+  document.getElementById("removeUnavailableOrderItems").hidden = true;
+  checkoutModal.style.display = "none";
+  cartModal.style.display = "flex";
+  lockBody();
+});
+
 function resetCheckoutSubmitButton() {
   const button = document.getElementById("createOrderBtn");
   if (!button) return;
@@ -2475,6 +2572,7 @@ function resetCheckoutSubmitButton() {
   button.disabled = false;
   button.removeAttribute("aria-busy");
   button.textContent = "Создать заказ";
+  document.getElementById("removeUnavailableOrderItems").hidden = true;
 
   const orderSubmitError = document.getElementById("orderSubmitError");
   if (orderSubmitError) {
@@ -2486,6 +2584,12 @@ function resetCheckoutSubmitButton() {
 function prepareCheckoutForOpen() {
   if (!orderSending) resetCheckoutSubmitButton();
   if (!foundClient) setCheckoutIdentityFieldsVisible(true);
+  if (!orderSending && rejectedOrderItems.length) {
+    const status = document.getElementById("orderSubmitError");
+    status.textContent = "Заказ не записан. Недоступны: " + rejectedOrderItems.map(item => item.title || item.id).join(", ") + ". Удалите недоступное и проверьте состав.";
+    status.hidden = false;
+    document.getElementById("removeUnavailableOrderItems").hidden = false;
+  }
   if (!orderSending && readPendingOrderRequest()) {
     const button = document.getElementById("createOrderBtn");
     const status = document.getElementById("orderSubmitError");

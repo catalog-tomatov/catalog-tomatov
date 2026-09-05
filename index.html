@@ -28,7 +28,7 @@
 
   <link
     rel="stylesheet"
-  href="style.css?v=59"
+  href="style.css?v=60"
   />
 
 <link rel="preload" as="image" href="./tomato/tomato-breath-loader.png" type="image/png" fetchpriority="high">
@@ -323,6 +323,15 @@ content="summary_large_image">
     Корзина
   </div>
 
+  <section id="cartRemovalNotice" class="cart-removal-notice" aria-label="Изменения корзины" hidden>
+    <div role="status" aria-live="polite" aria-atomic="true">
+      <strong>Недоступные сорта удалены из корзины</strong>
+      <ul id="cartRemovalList"></ul>
+      <p>Сумма пересчитана. Проверьте оставшийся состав перед оформлением.</p>
+    </div>
+    <button id="dismissCartRemovalNotice" type="button">Понятно</button>
+  </section>
+
   <div
     class="cart-items"
     id="cartItems"
@@ -496,6 +505,7 @@ content="summary_large_image">
   <div id="orderSubmitError" class="order-submit-error" role="alert" hidden>
     Сервер не ответил. Корзина сохранена — нажмите «Повторить».
   </div>
+  <button id="removeUnavailableOrderItems" type="button" hidden>Удалить недоступное</button>
   <button id="createOrderBtn" type="button">
     Создать заказ
   </button>
@@ -1093,7 +1103,7 @@ content="summary_large_image">
 
 <button id="backToTopBtn" class="back-to-top" type="button" aria-label="Вернуться наверх">↑</button>
 
-<script src="script.js?v=77"></script>
+<script src="script.js?v=79"></script>
 <script src="chat.js?v=48"></script>
 
 </body>
