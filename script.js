@@ -331,7 +331,7 @@ function getRetryablePendingOrderRequest(phone, items) {
   return pendingItems === currentItems ? { ...pending, payload } : null;
 }
 
-function getOrCreateClientRequestId(payload) {
+function getOrCreateClientRequestId(payload, submittedItems = []) {
   const signature = getOrderRequestSignature(payload);
 
   const pending = readPendingOrderRequest();
@@ -346,6 +346,7 @@ function getOrCreateClientRequestId(payload) {
       id,
       signature,
       payload: JSON.parse(signature),
+      displayItems: submittedItems,
       createdAt: new Date().toISOString(),
     }),
   );
@@ -397,6 +398,19 @@ async function fetchJsonWithTimeout(url, options = {}, timeoutMs = 12000) {
     throw error;
   } finally {
     clearTimeout(timeoutId);
+  }
+}
+
+// A lost response is not a rejected order. Replay the exact request once;
+// Apps Script returns its stored result when this ID has already committed.
+async function sendOrderWithRecovery(payload, onRecovery) {
+  const options = { method: "POST", body: JSON.stringify(payload) };
+  try {
+    return await fetchJsonWithTimeout(CATALOG_API_URL, options, ORDER_SUBMIT_REQUEST_TIMEOUT);
+  } catch (error) {
+    if (error.code !== "REQUEST_TIMEOUT" && error.name !== "TypeError") throw error;
+    onRecovery();
+    return await fetchJsonWithTimeout(CATALOG_API_URL, options, ORDER_SUBMIT_REQUEST_TIMEOUT);
   }
 }
 
@@ -1684,6 +1698,12 @@ function renderCart() {
 document.getElementById("openCartBtn").onclick = () => {
   vibrate(15);
   void refreshCatalogAvailabilityInBackground();
+  if (readPendingOrderRequest()) {
+    prepareCheckoutForOpen();
+    checkoutModal.style.display = "flex";
+    lockBody();
+    return;
+  }
 
   catalogScrollPosition = window.scrollY;
   sessionStorage.setItem("tomatoCatalogScroll", String(catalogScrollPosition));
@@ -1769,7 +1789,7 @@ touch-action:none;
 
 document.body.appendChild(blocker);
 
-  const pendingRequest = options.pendingRequest || null;
+  const pendingRequest = options.pendingRequest || readPendingOrderRequest();
   const pendingPayload = getPendingOrderPayload(pendingRequest);
 
   let name = pendingPayload
@@ -1798,7 +1818,9 @@ document.body.appendChild(blocker);
 
   const payloadItems = pendingPayload ? pendingPayload.items || [] : cart;
   const submittedItems = payloadItems.map((payloadItem) => {
-    const cartItem = cart.find(
+    const cartItem = (pendingRequest?.displayItems || []).find(
+      (item) => String(item.id) === String(payloadItem.id),
+    ) || cart.find(
       (item) => String(item.id) === String(payloadItem.id),
     );
 
@@ -1847,13 +1869,16 @@ document.body.appendChild(blocker);
 
   const clientRequestId = pendingRequest
     ? String(pendingRequest.id)
-    : getOrCreateClientRequestId(orderPayload);
+    : getOrCreateClientRequestId(orderPayload, submittedItems);
   orderPayload.clientRequestId = clientRequestId;
 
-  fetchJsonWithTimeout(CATALOG_API_URL, {
-    method: "POST",
-    body: JSON.stringify(orderPayload),
-  }, ORDER_SUBMIT_REQUEST_TIMEOUT)
+  sendOrderWithRecovery(orderPayload, () => {
+    if (orderSubmitError) {
+      orderSubmitError.textContent = "Ответ задерживается. Проверяем результат отправки — не создавайте заказ повторно.";
+      orderSubmitError.hidden = false;
+    }
+    btn.textContent = "Проверяем отправку…";
+  })
     .then((result) => {
       if (isSeasonClosedResponse(result)) {
         const seasonError = new Error("Сезон закрыт");
@@ -2021,11 +2046,15 @@ document.body.appendChild(blocker);
 
         lockBody();
 
-        cart = [];
+        // Preserve any other products added while confirmation was pending.
+        cart = cart.map((item) => {
+          const sent = submittedItems.find((entry) => String(entry.id) === String(item.id));
+          return { ...item, qty: Math.max(0, item.qty - (sent ? sent.qty : 0)) };
+        }).filter((item) => item.qty > 0);
 
         updateCart();
 
-       localStorage.removeItem("tomatoCart");
+       if (!cart.length) localStorage.removeItem("tomatoCart");
 
         savedSheetMode = false;
         document.getElementById("savedSheetActions").hidden = true;
@@ -2103,20 +2132,20 @@ document.body.appendChild(blocker);
       btn.classList.remove("loading-btn");
       btn.disabled = false;
       btn.removeAttribute("aria-busy");
-      btn.innerHTML = "Повторить";
+      btn.textContent = "Проверить отправку";
 
       if (orderSubmitError) {
         orderSubmitError.textContent =
           err && err.code === "REQUEST_TIMEOUT"
-            ? "Сервер отвечает дольше обычного. Корзина сохранена — нажмите «Повторить»."
-            : "Сервер не ответил. Корзина сохранена — нажмите «Повторить».";
+            ? "Подтверждение задерживается. Заказ мог уже сохраниться. Нажмите «Проверить отправку»: повтор использует тот же идентификатор. Можно вернуться назад — отправка сохранена."
+            : "Не удалось получить подтверждение. Отправка сохранена. Нажмите «Проверить отправку», не оформляйте её заново.";
         orderSubmitError.hidden = false;
       }
 
       showToast(
         err && err.code === "REQUEST_TIMEOUT"
-          ? "⚠️ Ответ задерживается. Корзина сохранена"
-          : "⚠️ Google временно не ответил. Корзина сохранена",
+          ? "Подтверждение задерживается. Отправка сохранена"
+          : "Подтверждение не получено. Отправка сохранена",
       );
     });
 }
@@ -2125,15 +2154,20 @@ document.body.appendChild(blocker);
 
 document.getElementById("createOrderBtn").onclick = async () => {
   if (orderSending) return;
-  if (!validateCheckoutForm()) return;
 
-  const phone = document.getElementById("clientPhone").value.trim().replace(/\D/g, "");
-  const pendingRequest = getRetryablePendingOrderRequest(phone, cart);
+  const pendingRequest = readPendingOrderRequest();
 
-  if (pendingRequest) {
+  if (pendingRequest && getPendingOrderPayload(pendingRequest)) {
     submitOrder({ pendingRequest });
     return;
   }
+
+  if (readPendingOrderRequest()) {
+    showToast("Не удалось прочитать сохранённую отправку. Не создавайте её заново; обратитесь к продавцу для проверки.");
+    return;
+  }
+  if (!validateCheckoutForm()) return;
+  const phone = document.getElementById("clientPhone").value.trim().replace(/\D/g, "");
 
   orderSending = true;
 
@@ -2362,6 +2396,10 @@ checkoutModal.addEventListener("click", (e) => {
   if (orderSending) return;
 
   if (e.target === checkoutModal) {
+    if (readPendingOrderRequest()) {
+      showToast("Отправка ещё не подтверждена. Проверьте её или используйте кнопку «Назад» — данные сохранятся.");
+      return;
+    }
     checkoutBox.classList.add("modal-hide");
 
     setTimeout(() => {
@@ -2448,6 +2486,16 @@ function resetCheckoutSubmitButton() {
 function prepareCheckoutForOpen() {
   if (!orderSending) resetCheckoutSubmitButton();
   if (!foundClient) setCheckoutIdentityFieldsVisible(true);
+  if (!orderSending && readPendingOrderRequest()) {
+    const button = document.getElementById("createOrderBtn");
+    const status = document.getElementById("orderSubmitError");
+    button.textContent = "Проверить отправку";
+    const pending = getPendingOrderPayload(readPendingOrderRequest());
+    status.textContent = "Есть неподтверждённая отправка" +
+      (pending ? " для «" + pending.name + "»" + (pending.selectedOrderId ? " в заказ " + pending.selectedOrderId : "") : "") +
+      ". Кнопка проверит именно прежнюю отправку, а не новые данные формы. Закрытие окна не удаляет её.";
+    status.hidden = false;
+  }
 }
 
 function resetCheckoutAfterSuccessfulOrder() {
