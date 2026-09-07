@@ -2678,9 +2678,9 @@ canvas {
   text-align: center;
   line-height: 1.4;
 
-  width: auto;
+  width: min(420px, calc(100% - 32px));
 
-  max-width: min(360px, calc(100vw - 32px));
+  max-width: none;
 
   padding: 14px 20px;
 

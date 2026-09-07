@@ -1,9 +1,9 @@
-const SHELL_CACHE = "catalog-shell-v100";
+const SHELL_CACHE = "catalog-shell-v101";
 const IMAGE_CACHE = "catalog-images-v5";
 const SHELL_FILES = [
   "./",
   "./index.html",
-  "./style.css?v=61",
+  "./style.css?v=62",
   "./script.js?v=79",
   "./chat.js?v=48",
   "./firebase-config.js?v=1",
