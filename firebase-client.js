@@ -60,7 +60,22 @@ export function initFirebase() {
       .then(({ appSdk, authSdk, firestoreSdk }) => {
         firebaseApp = appSdk.getApps().find((app) => app.name === "[DEFAULT]")
           || appSdk.initializeApp(firebaseConfig);
-        firebaseAuth = authSdk.getAuth(firebaseApp);
+        try {
+          // IndexedDB может закрываться браузером при обновлении PWA или
+          // сворачивании вкладки. Для анонимной авторизации достаточно
+          // localStorage; память остаётся последним безопасным резервом.
+          firebaseAuth = authSdk.initializeAuth(firebaseApp, {
+            persistence: [
+              authSdk.browserLocalPersistence,
+              authSdk.inMemoryPersistence,
+            ],
+          });
+        } catch (error) {
+          // Модуль мог быть загружен повторно во время обновления service
+          // worker. В этом случае используем уже созданный экземпляр Auth.
+          if (String(error?.code || "") !== "auth/already-initialized") throw error;
+          firebaseAuth = authSdk.getAuth(firebaseApp);
+        }
         firestoreDb = firestoreSdk.initializeFirestore(firebaseApp, {
           experimentalAutoDetectLongPolling: true,
         });
