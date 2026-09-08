@@ -161,6 +161,15 @@ const CHAT_PAYMENT = {
     const bridge = realtimeBridge();
     if (!bridge || !state.config?.seasonId || !access?.chatToken) return false;
 
+    // Firestore ускоряет чат, но не должен останавливать резервное чтение из
+    // Google Sheets, пока realtime-подписка подключается или недоступна.
+    if (
+      state.current &&
+      normalizeOrderId(state.current.order?.orderId) === normalizeOrderId(order.orderId)
+    ) {
+      startChatPolling();
+    }
+
     const key = orderKey(order.orderId);
     if (state.realtimeSubscriptions.has(key)) return true;
     const pendingConnection = state.realtimeConnections.get(key);
@@ -3187,20 +3196,37 @@ function queuedDelivery(request) {
     let result;
     let relayAcknowledged = null;
     if (!request.attachment && bridge?.sendText) {
+      let fallbackStarted = false;
+      let fallbackTimer = 0;
+      const realtimeDelivery = bridge.sendText({
+        apiUrl: chatApiUrl(),
+        seasonId: state.config?.seasonId || "",
+        orderId: request.orderId,
+        chatToken: request.chatToken,
+        sender: "client",
+        text: request.text,
+        messageId: request.clientMessageId || request.requestId,
+      }).then((realtimeResult) => {
+        const relay = realtimeResult.relayAcknowledged || null;
+        if (relay) relay.catch(() => undefined);
+        return { result: realtimeResult, relayAcknowledged: relay };
+      });
+      const durableDelivery = new Promise((resolve, reject) => {
+        fallbackTimer = window.setTimeout(() => {
+          fallbackStarted = true;
+          apiPost(request, 30000)
+            .then((serverResult) => resolve({ result: serverResult, relayAcknowledged: null }))
+            .catch(reject);
+        }, 700);
+      });
       try {
-        result = await bridge.sendText({
-          apiUrl: chatApiUrl(),
-          seasonId: state.config?.seasonId || "",
-          orderId: request.orderId,
-          chatToken: request.chatToken,
-          sender: "client",
-          text: request.text,
-          messageId: request.clientMessageId || request.requestId,
-        });
-        relayAcknowledged = result.relayAcknowledged || null;
-      } catch (realtimeError) {
-        console.warn("Мгновенная отправка недоступна, использован серверный канал", realtimeError);
-        result = await apiPost(request, 30000);
+        // Оба канала используют один ID сообщения, поэтому повтор безопасен:
+        // выигрывает Firestore, а при его зависании через 700 мс стартует Sheets.
+        const delivery = await Promise.any([realtimeDelivery, durableDelivery]);
+        result = delivery.result;
+        relayAcknowledged = delivery.relayAcknowledged;
+      } finally {
+        if (!fallbackStarted && fallbackTimer) window.clearTimeout(fallbackTimer);
       }
     } else {
       result = await apiPost(request, request.attachment ? 90000 : 30000);
