@@ -216,12 +216,6 @@ const CHAT_PAYMENT = {
         let payload = mergeChatPayload(memory, incoming);
         payload.summary = suppressReadSummary(normalized, payload.summary);
 
-        // Событие оплаты создаёт только авторизованный продавец. Оно содержит
-        // уже подтверждённое Пультом значение, поэтому карточка меняется в том
-        // же realtime-снимке, без ожидания резервного chat_summaries.
-        applyRealtimePaymentStatus(normalized, incoming?.messages);
-        applyTrustedChatOrderSnapshots(normalized, incoming?.messages);
-
         // Первый Firestore-снимок может быть старым. Но следующий документ от
         // Apps Script с более новым updatedAtIso создан уже после записи Sheets
         // и поэтому применяется сразу; chat_summaries остаётся страховкой.
@@ -230,6 +224,11 @@ const CHAT_PAYMENT = {
           incoming?.order,
           incoming?.summary,
         );
+
+        // The order and message listeners can emit separately. Adopt the
+        // document first, then the confirmed facts carried by these messages.
+        applyRealtimePaymentStatus(normalized, incoming?.messages);
+        applyTrustedChatOrderSnapshots(normalized, incoming?.messages);
 
         // Перед любым render возвращаем статус/суммы из source of truth.
         payload = applyLatestKnownOrderStatus(payload, normalized);
@@ -641,6 +640,7 @@ const dbDelete = (store, key) =>
   async function cacheChat(orderId, payload) {
     const normalized = normalizeOrderId(orderId);
     const key = orderKey(normalized);
+    payload = applyLatestKnownOrderStatus(payload, normalized);
     const currentEntry = state.chatCache.get(key) || {};
     state.chatCache.set(key, {
       ...currentEntry,
@@ -808,7 +808,9 @@ const dbDelete = (store, key) =>
     );
     if (!orderId) return null;
 
-    const revision = orderRevisionTime(order?.revision || summary?.revision);
+    const orderRevision = orderRevisionTime(order?.revision);
+    const summaryRevision = orderRevisionTime(summary?.revision);
+    const revision = Math.max(orderRevision, summaryRevision);
     const previousRevision = state.authoritativeOrderRevisions.get(orderId) || 0;
     // Source revisions and browser request times are different clocks. Once
     // a revisioned state is known, an old unversioned cache cannot replace it.
@@ -821,7 +823,9 @@ const dbDelete = (store, key) =>
 
     const previous = state.authoritativeOrders.get(orderId) || {};
     const next = { ...previous };
-    const sources = [order || {}, summary || {}];
+    const sources = summaryRevision > orderRevision
+      ? [summary || {}, order || {}]
+      : [order || {}, summary || {}];
 
     AUTHORITATIVE_ORDER_FIELDS.forEach((field) => {
       for (const source of sources) {
@@ -1276,15 +1280,12 @@ async function removeOutboxRequest(
       const requestedAt = Date.now();
       const incoming = await fetchChatHistory(order, access, lastServerMessageId(cached));
 
+      rememberAuthoritativeOrderState(normalized, incoming?.order, incoming?.summary, requestedAt);
       // Системная order_card создаётся Apps Script из свежего Sheets-снимка.
       // Применяем её вместе с delta-историей, чтобы карточка сохранённого заказа
       // не оставалась «ОПЛАЧЕНО», когда в чате уже видна требуемая доплата.
       applyRealtimePaymentStatus(normalized, incoming?.messages);
       applyTrustedChatOrderSnapshots(normalized, incoming?.messages);
-      // History includes the current order even when the delta contains only
-      // a payment text. Adopt these facts before restoring the guarded state.
-      rememberAuthoritativeOrderState(normalized, incoming?.order, incoming?.summary, requestedAt);
-
       const latest = state.chatCache.get(key)?.payload || await readCachedChat(normalized) || cached;
       let payload = mergeChatPayload(latest, incoming);
       payload.summary = suppressReadSummary(normalized, payload.summary);
@@ -1476,6 +1477,16 @@ async function removeOutboxRequest(
         state.summaries.set(key, item.summary);
 
         updateSavedOrderFromSnapshot(key, item.order, result.seasonId);
+        if (state.current?.payload
+          && normalizeOrderId(state.current.order?.orderId) === key
+          && !elements.chatModal.hidden) {
+          // Paint the confirmed response before awaiting IndexedDB writes,
+          // access lookups or reconnecting the other saved conversations.
+          const currentPayload = mergeChatPayload(state.current.payload, {
+            order:item.order, summary:item.summary, messagesMode:"delta", messages:[],
+          });
+          renderChatPayload(currentPayload, false);
+        }
       });
       const changedOrderIds = [];
       await Promise.all(result.summaries.map(async (item) => {
@@ -2297,12 +2308,18 @@ async function resumeOutboxForCurrentChat() {
   function renderChatPayload(payload, scrollToEnd = false) {
     if (!payload?.order || !Array.isArray(payload.messages)) return;
 
-    // Последняя страховка от гонки Firestore/chat_history:
-    // перед КАЖДЫМ render принудительно возвращаем статус из chat_summaries.
+    // Resolve facts from the very messages being displayed, so an alternate
+    // render path cannot show a confirmation while retaining an older badge.
     const authoritativeOrderId = normalizeOrderId(
       payload.order?.orderId || payload.summary?.orderId || state.current?.order?.orderId,
     );
+    applyRealtimePaymentStatus(authoritativeOrderId, payload.messages);
+    applyTrustedChatOrderSnapshots(authoritativeOrderId, payload.messages);
     payload = applyLatestKnownOrderStatus(payload, authoritativeOrderId);
+    if (state.current && normalizeOrderId(state.current.order?.orderId) === authoritativeOrderId) {
+      state.current.payload = payload;
+    }
+    commitChatSummary(authoritativeOrderId, payload);
 
     const hasCustomerMessage = payload.messages.some((message) => message.sender === "client");
     const showMaxWarning = Boolean(
