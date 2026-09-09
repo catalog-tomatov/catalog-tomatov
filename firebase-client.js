@@ -225,12 +225,6 @@ function firestoreDate(value, fallback = "") {
   return String(value || fallback || "");
 }
 
-function sourceRevisionTime(value) {
-  const raw = String(value || "");
-  const numeric = Number(raw.split("|")[0]);
-  return Number.isFinite(numeric) && numeric > 0 ? numeric : Date.parse(raw) || 0;
-}
-
 function realtimeMessage(documentSnapshot) {
   const data = documentSnapshot.data() || {};
   const isPaymentStatus = data.eventKind === "payment_status";
@@ -278,12 +272,7 @@ export async function subscribeRealtimeOrder({ seasonId, orderId, viewer, onData
 
   const emit = () => {
     if (!orderData || typeof onData !== "function") return;
-    const order = { ...(orderData.order || {}) };
-    // A partial payment write can update the document revision while leaving
-    // the nested revision unchanged. Both belong to this same source document.
-    if (sourceRevisionTime(orderData.revision) > sourceRevisionTime(order.revision)) {
-      order.revision = String(orderData.revision);
-    }
+    const order = orderData.order || {};
     const unread = messages.filter((message) => (
       (viewer === "seller"
         ? message.sender === "client"
@@ -307,7 +296,7 @@ export async function subscribeRealtimeOrder({ seasonId, orderId, viewer, onData
         debt: Number(order.debt ?? orderData.debt) || 0,
         source: String(orderData.source || ""),
         sourceUpdatedAt: firestoreDate(orderData.updatedAt, orderData.updatedAtIso),
-        revision: String(order.revision || orderData.revision || ""),
+        revision: String(orderData.revision || ""),
         realtimeFromCache: orderFromCache,
         unread,
         lastMessage: last ? messagePreview(last) : "Сообщений пока нет",
@@ -325,9 +314,7 @@ export async function subscribeRealtimeOrder({ seasonId, orderId, viewer, onData
     if (typeof onError === "function") onError(error);
   };
   const unsubscribers = [
-    // The Catalog waits for fromCache=false before trusting an order document.
-    // That transition can be metadata-only and otherwise never reaches emit().
-    firestoreSdk.onSnapshot(orderRef, { includeMetadataChanges: true }, (snapshot) => {
+    firestoreSdk.onSnapshot(orderRef, (snapshot) => {
       orderData = snapshot.exists() ? snapshot.data() : null;
       orderFromCache = snapshot.metadata.fromCache;
       emit();
