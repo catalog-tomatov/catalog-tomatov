@@ -1397,10 +1397,6 @@ async function removeOutboxRequest(
   async function refreshChatSummaries() {
     const refreshSequence = ++state.summaryRefreshSequence;
     const previousSummaries = new Map(state.summaries);
-    const pendingReads = Array.from(state.readStates.values())
-      .map((item) => item?.promise)
-      .filter(Boolean);
-    if (pendingReads.length) await Promise.allSettled(pendingReads);
     if (!state.config || state.config.seasonClosed || !savedOrders.length) {
       state.summaries.clear();
       updateAppBadge();
@@ -2027,13 +2023,22 @@ async function resumeOutboxForCurrentChat() {
 
     if (locallyConfirmed) {
       try {
+        const bridge = realtimeBridge();
+        if (!bridge?.acknowledgeMessage) continue;
+        await bridge.acknowledgeMessage({
+          apiUrl: chatApiUrl(),
+          orderId,
+          chatToken: request.chatToken,
+          messageId: locallyConfirmed.messageId,
+          sender: "client",
+        });
         await removeOutboxRequest(
           orderId,
           request.requestId
         );
       } catch (error) {
         console.warn(
-          "Не удалось очистить подтверждённый outbox",
+          "Не удалось подтвердить архив сообщения; outbox сохранён",
           error
         );
       }
@@ -2798,24 +2803,38 @@ return card;
           viewer: "client",
         })
       : Promise.resolve();
-    const request = realtimeRequest
-      .catch((error) => {
-        // Firestore read-state is an acceleration only. A temporary realtime
-        // failure must not prevent the durable Apps Script read receipt.
-        console.warn("Не удалось отметить realtime-чат прочитанным", error);
-      })
-      .then(() => apiPost({
-        action: "chat_read",
-        orderId,
-        chatToken,
-        viewer: "customer",
-      }))
-      .catch((error) => {
-        console.warn("Не удалось отметить чат прочитанным", error);
+    const durableRead = async () => {
+      let lastError = null;
+      for (let attempt = 0; attempt < 2; attempt += 1) {
+        try {
+          return await apiPost({
+            action: "chat_read",
+            orderId,
+            chatToken,
+            viewer: "customer",
+          }, 45000);
+        } catch (error) {
+          lastError = error;
+          if (attempt === 0) {
+            await new Promise((resolve) => window.setTimeout(resolve,2500));
+          }
+        }
+      }
+      throw lastError;
+    };
+    // Firestore и долговечная отметка Sheets независимы. Медленный Apps Script
+    // больше не удерживает сводку, статус заказа или счётчик интерфейса.
+    const request = Promise.allSettled([realtimeRequest,durableRead()])
+      .then((results) => {
+        if (results.every((result) => result.status === "rejected")) {
+          console.warn("Не удалось подтвердить отметку чата прочитанным");
+        } else if (results[1]?.status === "rejected") {
+          console.warn("Архивная отметка прочтения будет повторена при следующем открытии чата");
+        }
       })
       .finally(() => {
-      const latest = state.readStates.get(orderId);
-      if (latest?.promise === request) state.readStates.set(orderId, { ...latest, promise: null });
+        const latest = state.readStates.get(orderId);
+        if (latest?.promise === request) state.readStates.set(orderId, { ...latest, promise: null });
       });
     state.readStates.set(orderId, { ...existingState, promise: request });
     return request;

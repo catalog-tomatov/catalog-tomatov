@@ -411,13 +411,13 @@ export async function sendRealtimeText({ apiUrl, seasonId, orderId, chatToken, s
 
   // Firestore уже принял сообщение, поэтому второй участник не ждёт медленную
   // запись архива Apps Script. Outbox очистится после отдельного relay.
-  const relayAcknowledged = user.getIdToken().then((firebaseIdToken) => postJson(apiUrl, {
-    action: sender === "seller" ? "chat_firestore_seller_notify" : "chat_firestore_notify",
+  const relayAcknowledged = acknowledgeRealtimeMessage({
+    apiUrl,
     orderId,
     chatToken,
-    messageId: safeMessageId,
-    firebaseIdToken,
-  }, 30000));
+    messageId:safeMessageId,
+    sender,
+  });
 
   return {
     success: true,
@@ -428,6 +428,37 @@ export async function sendRealtimeText({ apiUrl, seasonId, orderId, chatToken, s
     },
     relayAcknowledged,
   };
+}
+
+const waitForRelayRetry = () => new Promise((resolve) => {
+  window.setTimeout(resolve,2500);
+});
+
+export async function acknowledgeRealtimeMessage({
+  apiUrl,
+  orderId,
+  chatToken = "",
+  messageId,
+  sender = "client",
+}) {
+  const { user } = await getFirebaseContext();
+  let lastError = null;
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    try {
+      const firebaseIdToken = await user.getIdToken();
+      return await postJson(apiUrl, {
+        action: sender === "seller" ? "chat_firestore_seller_notify" : "chat_firestore_notify",
+        orderId,
+        chatToken,
+        messageId,
+        firebaseIdToken,
+      }, 45000);
+    } catch (error) {
+      lastError = error;
+      if (attempt === 0) await waitForRelayRetry();
+    }
+  }
+  throw lastError;
 }
 
 export async function markRealtimeRead({ seasonId, orderId, viewer }) {
@@ -447,6 +478,7 @@ window.tomatoRealtime = Object.freeze({
   linkOrder: linkRealtimeOrder,
   subscribeOrder: subscribeRealtimeOrder,
   sendText: sendRealtimeText,
+  acknowledgeMessage: acknowledgeRealtimeMessage,
   markRead: markRealtimeRead,
   ready: getFirebaseContext,
 });
