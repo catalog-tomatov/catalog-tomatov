@@ -44,6 +44,7 @@ const CHAT_PAYMENT = {
     // Firestore может сигнализировать об изменении, но не перезаписывает эту истину.
     authoritativeOrders: new Map(),
     authoritativeOrderVersions: new Map(),
+    authoritativeOrderRevisions: new Map(),
     statusRefreshTimer: 0,
     statusRefreshPromise: null,
     statusRefreshQueued: false,
@@ -248,7 +249,7 @@ const CHAT_PAYMENT = {
           && !elements.chatModal.hidden
         ) {
           state.current.payload = payload;
-          stopChatPolling();
+          if (!state.pollTimer) startChatPolling();
           renderChatPayload(payload, false);
           if (Number(payload.summary?.unread || 0) > 0) {
             void markChatReadSnapshot(normalized, access.chatToken, payload);
@@ -787,7 +788,19 @@ const dbDelete = (store, key) =>
     "debt",
     "total",
     "issued",
+    "revision",
+    "itemCount",
+    "varietyCount",
+    "items",
+    "name",
+    "pickup",
   ];
+
+  function orderRevisionTime(value) {
+    const raw = String(value || "");
+    const numeric = Number(raw.split("|")[0]);
+    return Number.isFinite(numeric) && numeric > 0 ? numeric : Date.parse(raw) || 0;
+  }
 
   function rememberAuthoritativeOrderState(orderIdValue, order = null, summary = null, sourceVersion = Date.now()) {
     const orderId = normalizeOrderId(
@@ -795,13 +808,20 @@ const dbDelete = (store, key) =>
     );
     if (!orderId) return null;
 
+    const revision = orderRevisionTime(order?.revision || summary?.revision);
+    const previousRevision = state.authoritativeOrderRevisions.get(orderId) || 0;
+    // Source revisions and browser request times are different clocks. Once
+    // a revisioned state is known, an old unversioned cache cannot replace it.
+    if (previousRevision && (!revision || revision < previousRevision)) {
+      return state.authoritativeOrders.get(orderId) || null;
+    }
     const version = Number(sourceVersion) || Date.now();
     const previousVersion = state.authoritativeOrderVersions.get(orderId) || 0;
-    if (version < previousVersion) return state.authoritativeOrders.get(orderId) || null;
+    if (!revision && version < previousVersion) return state.authoritativeOrders.get(orderId) || null;
 
     const previous = state.authoritativeOrders.get(orderId) || {};
     const next = { ...previous };
-    const sources = [summary || {}, order || {}];
+    const sources = [order || {}, summary || {}];
 
     AUTHORITATIVE_ORDER_FIELDS.forEach((field) => {
       for (const source of sources) {
@@ -820,6 +840,7 @@ const dbDelete = (store, key) =>
     else if (next.status) next.issued = false;
 
     state.authoritativeOrders.set(orderId, next);
+    if (revision) state.authoritativeOrderRevisions.set(orderId, revision);
     state.authoritativeOrderVersions.set(orderId, version);
     return next;
   }
@@ -865,6 +886,7 @@ const dbDelete = (store, key) =>
       ? Math.max(Number(payment.paidAmount) || total, 0)
       : 0;
     const patch = {
+      revision: payment.revision || "",
       status: payment.paymentStatus,
       statusLabel: payment.paymentStatus === "paid" ? "Оплачено" : "Не оплачено",
       prepayment: paidAmount,
@@ -891,7 +913,7 @@ const dbDelete = (store, key) =>
     messages
       .filter((message) => (
         message?.sender === "system"
-        && message?.type === "order_card"
+        && (message?.type === "order_card" || message?.type === "system")
         && message?.snapshot
         && ["unpaid", "debt", "paid", "issued"].includes(String(message.snapshot.status || ""))
       ))
@@ -976,7 +998,6 @@ const dbDelete = (store, key) =>
     if (confirmedRealtimeChange) {
       // Этот документ записан Apps Script уже после SpreadsheetApp.flush().
       // Применяем его сразу; медленный chat_summaries остаётся только резервом.
-      state.summaryRefreshSequence += 1;
       rememberAuthoritativeOrderState(orderId, firestoreOrder, firestoreSummary, firestoreVersion);
       state.firestoreStatusSignals.delete(orderId);
       return;
@@ -1234,7 +1255,8 @@ async function removeOutboxRequest(
       ...cached,
       ...incoming,
       order: incoming?.order || cached.order,
-      summary: incoming?.summary || cached.summary,
+      summary: (Date.parse(cached.summary?.lastAt || "") || 0) > (Date.parse(incoming?.summary?.lastAt || "") || 0)
+        ? cached.summary : incoming?.summary || cached.summary,
       messagesMode: "full",
       messages,
     };
@@ -1251,6 +1273,7 @@ async function removeOutboxRequest(
       const access = suppliedAccess || await getAccess(normalized);
       if (!access?.chatToken) throw new Error("Чат ещё не создан.");
       const cached = entry?.payload || await readCachedChat(normalized);
+      const requestedAt = Date.now();
       const incoming = await fetchChatHistory(order, access, lastServerMessageId(cached));
 
       // Системная order_card создаётся Apps Script из свежего Sheets-снимка.
@@ -1258,6 +1281,9 @@ async function removeOutboxRequest(
       // не оставалась «ОПЛАЧЕНО», когда в чате уже видна требуемая доплата.
       applyRealtimePaymentStatus(normalized, incoming?.messages);
       applyTrustedChatOrderSnapshots(normalized, incoming?.messages);
+      // History includes the current order even when the delta contains only
+      // a payment text. Adopt these facts before restoring the guarded state.
+      rememberAuthoritativeOrderState(normalized, incoming?.order, incoming?.summary, requestedAt);
 
       const latest = state.chatCache.get(key)?.payload || await readCachedChat(normalized) || cached;
       let payload = mergeChatPayload(latest, incoming);
@@ -1336,6 +1362,7 @@ async function removeOutboxRequest(
     state.summaries.clear();
     state.authoritativeOrders.clear();
     state.authoritativeOrderVersions.clear();
+    state.authoritativeOrderRevisions.clear();
     state.firestoreStatusSignals.clear();
     state.firestoreStatusVersions.clear();
     if (state.statusRefreshTimer) {
@@ -1404,6 +1431,7 @@ async function removeOutboxRequest(
   }
 
   async function refreshChatSummaries() {
+    const requestedAt = Date.now();
     const refreshSequence = ++state.summaryRefreshSequence;
     const previousSummaries = new Map(state.summaries);
     const pendingReads = Array.from(state.readStates.values())
@@ -1434,13 +1462,17 @@ async function removeOutboxRequest(
         item.summary = suppressReadSummary(key, item.summary);
 
         // chat_summaries — подтверждённое состояние из Google Sheets.
-        rememberAuthoritativeOrderState(key, item.order, item.summary);
+        rememberAuthoritativeOrderState(key, item.order, item.summary, requestedAt);
         const authoritativePayload = applyLatestKnownOrderStatus(
           { order: item.order || {}, summary: item.summary || {} },
           key,
         );
         item.order = authoritativePayload.order;
         item.summary = authoritativePayload.summary;
+        const previous = state.summaries.get(key);
+        if ((Date.parse(previous?.lastAt || "") || 0) > (Date.parse(item.summary?.lastAt || "") || 0)) {
+          item.summary = {...item.summary,lastAt:previous.lastAt,lastMessage:previous.lastMessage,unread:previous.unread};
+        }
         state.summaries.set(key, item.summary);
 
         updateSavedOrderFromSnapshot(key, item.order, result.seasonId);
@@ -2832,10 +2864,10 @@ return card;
 
   function startChatPolling() {
     stopChatPolling();
-    if (state.current && state.realtimeReady.has(orderKey(state.current.order?.orderId))) return;
     if (!state.current || document.hidden || elements.chatModal.hidden) return;
     const recentlyActive = Date.now() - state.chatActivityAt < CHAT_POLL_FAST_WINDOW;
-    const interval = recentlyActive ? CHAT_POLL_FAST_INTERVAL : CHAT_POLL_IDLE_INTERVAL;
+    const connected = state.realtimeReady.has(orderKey(state.current.order?.orderId));
+    const interval = !connected && recentlyActive ? CHAT_POLL_FAST_INTERVAL : CHAT_POLL_IDLE_INTERVAL;
     state.pollTimer = window.setTimeout(pollCurrentChat, interval);
   }
 
