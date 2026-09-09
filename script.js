@@ -3769,6 +3769,8 @@ async function refreshCatalogInBackground({ minimumAge = 0 } = {}) {
     ?.classList.contains("season-closed");
 
   if (document.hidden || orderSending) return null;
+  const openChat = document.getElementById("orderChatModal");
+  if (openChat && !openChat.hidden) return null;
   if (!catalogReady && !seasonClosed) return null;
 
   const now = Date.now();
@@ -4392,7 +4394,7 @@ if (pendingSheetData) {
 
 if ('serviceWorker' in navigator) {
   window.addEventListener('load', () => {
-    navigator.serviceWorker.register("./sw.js?v=113");
+    navigator.serviceWorker.register("./sw.js?v=114");
   });
 }
 

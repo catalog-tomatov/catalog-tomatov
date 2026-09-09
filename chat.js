@@ -875,14 +875,14 @@ const dbDelete = (store, key) =>
     const orderId = normalizeOrderId(orderIdValue);
     if (!orderId || !Array.isArray(messages)) return;
 
-    // После ручного изменения заказа Apps Script добавляет системную карточку
-    // с уже пересчитанными total/prepayment/debt. Это тот же подтверждённый
-    // Sheets-снимок, который видит открытый чат, поэтому статус превью должен
-    // обновиться вместе с сообщением, не ожидая отдельного chat_summaries.
+    // После ручного изменения заказа Apps Script добавляет карточку, а после
+    // оплаты — системное сообщение с тем же подтверждённым Sheets-снимком.
+    // Оба варианта должны обновить шапку вместе с сообщением, даже если общий
+    // запрос каталога или Firestore временно недоступны.
     messages
       .filter((message) => (
         message?.sender === "system"
-        && message?.type === "order_card"
+        && (message?.type === "order_card" || message?.type === "system")
         && message?.snapshot
         && ["unpaid", "debt", "paid", "issued"].includes(String(message.snapshot.status || ""))
       ))
