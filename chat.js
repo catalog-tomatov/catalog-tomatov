@@ -48,6 +48,8 @@ const CHAT_PAYMENT = {
     statusRefreshPromise: null,
     statusRefreshQueued: false,
     summaryRefreshSequence: 0,
+    summariesRefreshPromise: null,
+    summariesRefreshQueued: false,
     firestoreStatusSignals: new Map(),
     firestoreStatusVersions: new Map(),
     access: new Map(),
@@ -1395,6 +1397,24 @@ async function removeOutboxRequest(
   }
 
   async function refreshChatSummaries() {
+    if (state.summariesRefreshPromise) {
+      state.summariesRefreshQueued = true;
+      return state.summariesRefreshPromise;
+    }
+    const request = refreshChatSummariesNow().finally(() => {
+      if (state.summariesRefreshPromise === request) {
+        state.summariesRefreshPromise = null;
+      }
+      if (state.summariesRefreshQueued) {
+        state.summariesRefreshQueued = false;
+        if (!document.hidden) void refreshChatSummaries();
+      }
+    });
+    state.summariesRefreshPromise = request;
+    return request;
+  }
+
+  async function refreshChatSummariesNow() {
     const refreshSequence = ++state.summaryRefreshSequence;
     const previousSummaries = new Map(state.summaries);
     if (!state.config || state.config.seasonClosed || !savedOrders.length) {
@@ -1487,6 +1507,44 @@ async function removeOutboxRequest(
       void cacheChat(currentOrderId, correctedPayload);
       renderChatPayload(correctedPayload, false);
     }
+  }
+
+  function applyPushedOrderFacts(orderIdValue, pushedOrder, revisionValue) {
+    const orderId = normalizeOrderId(orderIdValue);
+    if (!orderId || !pushedOrder || typeof pushedOrder !== "object") return false;
+    if (normalizeOrderId(pushedOrder.orderId || pushedOrder.id) !== orderId) return false;
+    if (!["unpaid", "debt", "paid", "issued"].includes(String(pushedOrder.status || ""))) return false;
+    const revision = String(revisionValue || pushedOrder.revision || "");
+    const version = Number(revision.split("|")[0]) || Date.parse(pushedOrder.updatedAt || "") || 0;
+    if (!version || version < (state.authoritativeOrderVersions.get(orderId) || 0)) return false;
+    const snapshot = {
+      orderId,
+      status: String(pushedOrder.status),
+      statusLabel: pushedOrder.status === "debt" ? "Требуется доплатить"
+        : pushedOrder.status === "paid" ? "Оплачено"
+        : pushedOrder.status === "issued" ? "Выдан" : "Не оплачено",
+      total: Math.max(Number(pushedOrder.total) || 0, 0),
+      itemCount: Math.max(Number(pushedOrder.itemCount) || 0, 0),
+      prepayment: Math.max(Number(pushedOrder.prepayment) || 0, 0),
+      debt: Math.max(Number(pushedOrder.debt) || 0, 0),
+      issued: pushedOrder.status === "issued",
+    };
+    rememberAuthoritativeOrderState(orderId,snapshot,snapshot,version);
+    const previousSummary = state.summaries.get(orderId) || {};
+    const corrected = applyLatestKnownOrderStatus({
+      order:snapshot,
+      summary:{...previousSummary,...snapshot},
+    },orderId);
+    state.summaries.set(orderId,corrected.summary);
+    updateSavedOrderFromSnapshot(orderId,corrected.order,state.config?.seasonId || "");
+    renderSavedOrdersSummary();
+    if (document.getElementById("savedOrdersModal")?.style.display === "flex") renderSavedOrdersList();
+    updateAppBadge();
+    if (state.current?.payload && normalizeOrderId(state.current.order?.orderId) === orderId) {
+      state.current.payload = applyLatestKnownOrderStatus(state.current.payload,orderId);
+      renderChatPayload(state.current.payload,false);
+    }
+    return true;
   }
 
   function getOrderChatUnreadTotal() {
@@ -3665,6 +3723,7 @@ function queuedDelivery(request) {
     }
 
     if (payload.type !== "catalog-chat-message") return;
+    applyPushedOrderFacts(orderId,payload.order,payload.revision);
     if (orderId) preloadOrderChat(orderId);
     if (state.current && normalizeOrderId(state.current.order?.orderId) === orderId) {
       activateChatPolling(true);
@@ -3680,6 +3739,13 @@ function queuedDelivery(request) {
       void refreshChatSummaries();
     }
   });
+
+  // Push is the fast path. This 15-second cycle is an independent safety net
+  // for every saved order when Web Push or Firestore is unavailable.
+  window.setInterval(() => {
+    if (document.hidden || state.config?.seasonClosed || !savedOrders.length) return;
+    void refreshChatSummaries();
+  }, 15000);
 
   window.getOrderChatUnreadTotal_ = getOrderChatUnreadTotal;
   window.appendSavedOrderChatControls_ = appendSavedOrderChatControls;

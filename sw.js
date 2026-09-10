@@ -1,4 +1,4 @@
-const SHELL_CACHE = "catalog-shell-v115";
+const SHELL_CACHE = "catalog-shell-v116";
 const IMAGE_CACHE = "catalog-images-v5";
 const BADGE_COUNTER_URL = "./__catalog_badge_counter__";
 const SHELL_FILES = [
@@ -6,7 +6,7 @@ const SHELL_FILES = [
   "./index.html",
   "./style.css?v=59",
   "./script.js?v=82",
-  "./chat.js?v=20260909-sync2",
+  "./chat.js?v=20260910-sync3",
   "./firebase-config.js?v=1",
   "./firebase-client.js?v=20260909-sync1",
   "./manifest.json",
@@ -171,6 +171,8 @@ self.addEventListener("push", (event) => {
           type: "catalog-chat-message",
           orderId,
           messageId: String(payload.messageId || ""),
+          order: payload.order && typeof payload.order === "object" ? payload.order : null,
+          revision: String(payload.revision || ""),
         }),
       );
       await readBadgeCount().then((count) => writeBadgeCount(count + 1));
