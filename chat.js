@@ -750,18 +750,6 @@ const dbDelete = (store, key) =>
     ]);
   }
 
-  function summaryChanged(previous, next) {
-    if (!previous || !next) return false;
-    return String(previous.lastAt || "") !== String(next.lastAt || "")
-      || String(previous.lastMessage || "") !== String(next.lastMessage || "")
-      || Number(next.unread || 0) > Number(previous.unread || 0)
-      || String(previous.status || "") !== String(next.status || "")
-      || String(previous.statusLabel || "") !== String(next.statusLabel || "")
-      || Number(previous.prepayment || 0) !== Number(next.prepayment || 0)
-      || Number(previous.debt || 0) !== Number(next.debt || 0)
-      || Number(previous.total || 0) !== Number(next.total || 0);
-  }
-
   function suppressReadSummary(orderId, summary) {
     if (!summary) return summary;
     const readState = state.readStates.get(normalizeOrderId(orderId));
@@ -1304,18 +1292,6 @@ async function removeOutboxRequest(
     return true;
   }
 
-  function preloadOrderChat(orderId) {
-    void refreshChatCache(orderId)
-      .then((payload) => showRefreshedChatIfOpen(orderId, payload, false))
-      .catch((error) => {
-        if (
-          state.current
-          && normalizeOrderId(state.current.order?.orderId) === normalizeOrderId(orderId)
-        ) setChatError("Не удалось обновить сообщения. Повторим автоматически.");
-        else if (error?.code !== "REQUEST_TIMEOUT") console.warn("Предзагрузка чата отложена", error);
-      });
-  }
-
   async function clearClosedClientData() {
     stopRealtimeSubscriptions();
     [
@@ -1416,7 +1392,6 @@ async function removeOutboxRequest(
 
   async function refreshChatSummariesNow() {
     const refreshSequence = ++state.summaryRefreshSequence;
-    const previousSummaries = new Map(state.summaries);
     if (!state.config || state.config.seasonClosed || !savedOrders.length) {
       state.summaries.clear();
       updateAppBadge();
@@ -1452,12 +1427,9 @@ async function removeOutboxRequest(
 
         updateSavedOrderFromSnapshot(key, item.order, result.seasonId);
       });
-      const changedOrderIds = [];
       await Promise.all(result.summaries.map(async (item) => {
         const itemOrderId = item.order?.orderId || item.summary?.orderId;
         const cached = await readCachedChat(itemOrderId);
-        const key = normalizeOrderId(itemOrderId);
-        const previous = previousSummaries.get(key) || cached?.summary;
         await cacheChat(itemOrderId, {
           ...(cached || {}),
           order: item.order || cached?.order,
@@ -1465,7 +1437,6 @@ async function removeOutboxRequest(
           messagesMode: "full",
           messages: Array.isArray(cached?.messages) ? cached.messages : [],
         });
-        if (summaryChanged(previous, item.summary)) changedOrderIds.push(itemOrderId);
         const access = await getAccess(itemOrderId).catch(() => null);
         const savedOrder = findSavedOrder(itemOrderId);
         if (access?.chatToken && savedOrder) {
@@ -1474,7 +1445,6 @@ async function removeOutboxRequest(
           });
         }
       }));
-      changedOrderIds.forEach(preloadOrderChat);
     } catch (error) {
       if (refreshSequence !== state.summaryRefreshSequence) return;
       if (error?.code !== "REQUEST_TIMEOUT") {
@@ -3724,7 +3694,6 @@ function queuedDelivery(request) {
 
     if (payload.type !== "catalog-chat-message") return;
     applyPushedOrderFacts(orderId,payload.order,payload.revision);
-    if (orderId) preloadOrderChat(orderId);
     if (state.current && normalizeOrderId(state.current.order?.orderId) === orderId) {
       activateChatPolling(true);
     } else {
