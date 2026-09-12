@@ -16,6 +16,8 @@ const CATALOG_AVAILABILITY_REFRESH_INTERVAL = 10 * 1000;
 const CATALOG_REQUEST_TIMEOUT = 30 * 1000;
 const CATALOG_RESUME_REFRESH_AFTER = 0;
 const ORDER_SUBMIT_REQUEST_TIMEOUT = 25 * 1000;
+const ADDON_SUBMIT_REQUEST_TIMEOUT = 45 * 1000;
+const ORDER_RECOVERY_REQUEST_TIMEOUT = 30 * 1000;
 
 let catalogReady = false;
 let catalogLastSuccessfulRefreshAt = 0;
@@ -27,6 +29,8 @@ const SAVED_ORDERS_KEY = "savedOrders";
 const SAVED_ORDERS_LIMIT = 10;
 const ORDER_DRAFT_KEY = "tomatoOrderDraft";
 const PENDING_ORDER_REQUEST_KEY = "tomatoPendingOrderRequest";
+const CART_REMOVALS_KEY = "tomatoCartRemovalsV1";
+let rejectedOrderItems = [];
 const RESET_VERSION_KEY = "tomatoResetVersion";
 const RESET_DATE = new Date("2027-06-01T00:00:00+03:00").getTime();
 const RESET_VERSION = "2027-06-01";
@@ -41,6 +45,7 @@ function runScheduledStorageReset(now = Date.now()) {
     ORDER_DRAFT_KEY,
     "pendingSheet",
     PENDING_ORDER_REQUEST_KEY,
+    CART_REMOVALS_KEY,
   ].forEach((key) => localStorage.removeItem(key));
 
   localStorage.setItem(RESET_VERSION_KEY, RESET_VERSION);
@@ -331,7 +336,7 @@ function getRetryablePendingOrderRequest(phone, items) {
   return pendingItems === currentItems ? { ...pending, payload } : null;
 }
 
-function getOrCreateClientRequestId(payload) {
+function getOrCreateClientRequestId(payload, displayItems = []) {
   const signature = getOrderRequestSignature(payload);
 
   const pending = readPendingOrderRequest();
@@ -340,16 +345,44 @@ function getOrCreateClientRequestId(payload) {
   }
 
   const id = createClientRequestId();
+  const savedDisplayItems = (displayItems || []).map((item) => ({
+    id: item.id,
+    title: String(item.title || ""),
+    price: Number(item.price) || 0,
+    qty: Number(item.qty) || 0,
+  }));
   localStorage.setItem(
     PENDING_ORDER_REQUEST_KEY,
     JSON.stringify({
       id,
       signature,
       payload: JSON.parse(signature),
+      displayItems: savedDisplayItems,
       createdAt: new Date().toISOString(),
     }),
   );
   return id;
+}
+
+function commitConfirmedOrderCart(currentCart, submittedItems, requestId) {
+  const submittedById = new Map();
+  (submittedItems || []).forEach((item) => {
+    const key = String(item.id);
+    submittedById.set(key, (submittedById.get(key) || 0) + (Number(item.qty) || 0));
+  });
+
+  const remaining = (currentCart || []).map((item) => {
+    const submittedQty = submittedById.get(String(item.id)) || 0;
+    return { ...item, qty: Math.max(0, (Number(item.qty) || 0) - submittedQty) };
+  }).filter((item) => item.qty > 0);
+
+  if (remaining.length) {
+    localStorage.setItem("tomatoCart", JSON.stringify(remaining));
+  } else {
+    localStorage.removeItem("tomatoCart");
+  }
+  clearClientRequestId(requestId);
+  return remaining;
 }
 
 function clearClientRequestId(requestId) {
@@ -398,6 +431,47 @@ async function fetchJsonWithTimeout(url, options = {}, timeoutMs = 12000) {
   } finally {
     clearTimeout(timeoutId);
   }
+}
+
+async function sendOrderWithRecovery(orderPayload, onRecovery) {
+  const requestBody = JSON.stringify(orderPayload);
+  const requestOptions = {
+    method: "POST",
+    body: requestBody,
+  };
+  const initialTimeout = String(orderPayload?.mode || "").toLowerCase() === "addon"
+    ? ADDON_SUBMIT_REQUEST_TIMEOUT
+    : ORDER_SUBMIT_REQUEST_TIMEOUT;
+
+  try {
+    return await fetchJsonWithTimeout(
+      CATALOG_API_URL,
+      requestOptions,
+      initialTimeout,
+    );
+  } catch (error) {
+    if (error?.code !== "REQUEST_TIMEOUT") throw error;
+    if (typeof onRecovery === "function") onRecovery();
+    // Повторяем тот же запрос с тем же clientRequestId. Сервер вернёт уже
+    // сохранённый результат и не создаст второй заказ или второй дозаказ.
+    return fetchJsonWithTimeout(
+      CATALOG_API_URL,
+      requestOptions,
+      ORDER_RECOVERY_REQUEST_TIMEOUT,
+    );
+  }
+}
+
+function getOrderResultError(result) {
+  if (result?.success === true && result.orderId) return null;
+  const error = new Error(result?.error || "Сервер не вернул номер заказа");
+  if (result?.success === false && result.writeState === "not_written") {
+    error.code = "ORDER_NOT_WRITTEN";
+    error.unavailableItems = Array.isArray(result.unavailableItems)
+      ? result.unavailableItems.filter((item) => item && typeof item.id === "string")
+      : [];
+  }
+  return error;
 }
 
 function readCatalogCache(allowExpired = false) {
@@ -829,7 +903,59 @@ function getCatalogSignature(list) {
   );
 }
 
+let cartRemovalNotices = readCartRemovalNotices();
+
+function readCartRemovalNotices() {
+  try {
+    const value = JSON.parse(localStorage.getItem(CART_REMOVALS_KEY) || "[]");
+    return Array.isArray(value)
+      ? [...new Set(value.filter((name) => typeof name === "string" && name.trim()))]
+      : [];
+  } catch (error) {
+    return [];
+  }
+}
+
+function renderCartRemovalNotice() {
+  const banner = document.getElementById("cartRemovalNotice");
+  const list = document.getElementById("cartRemovalList");
+  if (!banner || !list) return;
+  list.replaceChildren();
+  cartRemovalNotices.forEach((name) => {
+    const item = document.createElement("li");
+    item.textContent = name;
+    list.appendChild(item);
+  });
+  banner.hidden = cartRemovalNotices.length === 0;
+}
+
+function rememberCartRemovals(names) {
+  if (!names.length) return;
+  cartRemovalNotices = [...new Set([...cartRemovalNotices, ...names])];
+  try {
+    localStorage.setItem(CART_REMOVALS_KEY, JSON.stringify(cartRemovalNotices));
+  } catch (error) {
+    console.warn("Уведомление корзины сохранено только до закрытия страницы", error);
+  }
+  renderCartRemovalNotice();
+}
+
+document.getElementById("dismissCartRemovalNotice")?.addEventListener("click", () => {
+  cartRemovalNotices = [];
+  try {
+    localStorage.removeItem(CART_REMOVALS_KEY);
+  } catch (error) {
+    console.warn("Не удалось сохранить закрытие уведомления корзины", error);
+  }
+  renderCartRemovalNotice();
+});
+renderCartRemovalNotice();
+
 function syncCartWithCatalog(nextProducts) {
+  // Не меняем корзину, пока сервер подтверждает уже отправленный состав.
+  if (readPendingOrderRequest() || rejectedOrderItems.length) {
+    return { removed: [], priceChanges: [] };
+  }
   const freshById = new Map(
     nextProducts.map((product) => [String(product.id), product]),
   );
@@ -863,6 +989,7 @@ function syncCartWithCatalog(nextProducts) {
     ];
   });
 
+  rememberCartRemovals(removed);
   updateCart();
   return { removed, priceChanges };
 }
@@ -1769,7 +1896,7 @@ touch-action:none;
 
 document.body.appendChild(blocker);
 
-  const pendingRequest = options.pendingRequest || null;
+  const pendingRequest = options.pendingRequest || readPendingOrderRequest();
   const pendingPayload = getPendingOrderPayload(pendingRequest);
 
   let name = pendingPayload
@@ -1797,8 +1924,13 @@ document.body.appendChild(blocker);
 }
 
   const payloadItems = pendingPayload ? pendingPayload.items || [] : cart;
+  const pendingDisplayItems = Array.isArray(pendingRequest?.displayItems)
+    ? pendingRequest.displayItems
+    : [];
   const submittedItems = payloadItems.map((payloadItem) => {
-    const cartItem = cart.find(
+    const cartItem = pendingDisplayItems.find(
+      (item) => String(item.id) === String(payloadItem.id),
+    ) || cart.find(
       (item) => String(item.id) === String(payloadItem.id),
     );
 
@@ -1847,13 +1979,16 @@ document.body.appendChild(blocker);
 
   const clientRequestId = pendingRequest
     ? String(pendingRequest.id)
-    : getOrCreateClientRequestId(orderPayload);
+    : getOrCreateClientRequestId(orderPayload, submittedItems);
   orderPayload.clientRequestId = clientRequestId;
 
-  fetchJsonWithTimeout(CATALOG_API_URL, {
-    method: "POST",
-    body: JSON.stringify(orderPayload),
-  }, ORDER_SUBMIT_REQUEST_TIMEOUT)
+  sendOrderWithRecovery(orderPayload, () => {
+    if (!orderSubmitError) return;
+    orderSubmitError.textContent = orderPayload.mode === "addon"
+      ? "Дозаказ отправлен. Проверяем подтверждение сервера…"
+      : "Заказ отправлен. Проверяем подтверждение сервера…";
+    orderSubmitError.hidden = false;
+  })
     .then((result) => {
       if (isSeasonClosedResponse(result)) {
         const seasonError = new Error("Сезон закрыт");
@@ -1861,13 +1996,8 @@ document.body.appendChild(blocker);
         throw seasonError;
       }
 
-      if (!result || !result.success || !result.orderId) {
-        throw new Error(
-          result && result.error
-            ? String(result.error)
-            : "Сервер не вернул номер заказа",
-        );
-      }
+      const resultError = getOrderResultError(result);
+      if (resultError) throw resultError;
 
       if (result.mode === "addon" || result.mode === "normal") {
         orderMode = result.mode;
@@ -1976,7 +2106,7 @@ document.body.appendChild(blocker);
 
       sheetItems.innerHTML = "";
 
-      sheetItems.innerHTML = cart
+      sheetItems.innerHTML = submittedItems
         .map((item) => {
           const shortTitle =
             item.title.length > 14
@@ -2005,7 +2135,7 @@ document.body.appendChild(blocker);
   </div>
 `;
       navigator.vibrate?.([80, 50, 80]);
-      clearClientRequestId(clientRequestId);
+      cart = commitConfirmedOrderCart(cart, submittedItems, clientRequestId);
       setTimeout(() => {
         document.getElementById("loadingBlocker")?.remove();
 
@@ -2021,11 +2151,7 @@ document.body.appendChild(blocker);
 
         lockBody();
 
-        cart = [];
-
         updateCart();
-
-       localStorage.removeItem("tomatoCart");
 
         savedSheetMode = false;
         document.getElementById("savedSheetActions").hidden = true;
@@ -2103,20 +2229,40 @@ document.body.appendChild(blocker);
       btn.classList.remove("loading-btn");
       btn.disabled = false;
       btn.removeAttribute("aria-busy");
-      btn.innerHTML = "Повторить";
+
+      if (err?.code === "ORDER_NOT_WRITTEN") {
+        clearClientRequestId(clientRequestId);
+        foundClient = null;
+        setCheckoutIdentityFieldsVisible(true);
+        nameInput.value = name;
+        phoneInput.value = phone;
+        btn.textContent = "Создать заказ";
+        if (orderSubmitError) {
+          orderSubmitError.textContent =
+            "Заказ не записан. " + err.message + ". Исправьте состав или данные и отправьте снова.";
+          orderSubmitError.hidden = false;
+        }
+        rejectedOrderItems = err.unavailableItems || [];
+        const removeButton = document.getElementById("removeUnavailableOrderItems");
+        if (removeButton) removeButton.hidden = !rejectedOrderItems.length;
+        showToast("Заказ не записан. Проверьте сообщение в форме оформления.");
+        return;
+      }
+
+      btn.textContent = "Проверить отправку";
 
       if (orderSubmitError) {
         orderSubmitError.textContent =
           err && err.code === "REQUEST_TIMEOUT"
-            ? "Сервер отвечает дольше обычного. Корзина сохранена — нажмите «Повторить»."
-            : "Сервер не ответил. Корзина сохранена — нажмите «Повторить».";
+            ? "Подтверждение задерживается. Нажмите «Проверить отправку»: повтор использует тот же запрос и не создаст дубль."
+            : "Не удалось получить подтверждение. Отправка сохранена — нажмите «Проверить отправку».";
         orderSubmitError.hidden = false;
       }
 
       showToast(
         err && err.code === "REQUEST_TIMEOUT"
-          ? "⚠️ Ответ задерживается. Корзина сохранена"
-          : "⚠️ Google временно не ответил. Корзина сохранена",
+          ? "Подтверждение задерживается. Отправка сохранена"
+          : "Подтверждение не получено. Отправка сохранена",
       );
     });
 }
@@ -2125,15 +2271,18 @@ document.body.appendChild(blocker);
 
 document.getElementById("createOrderBtn").onclick = async () => {
   if (orderSending) return;
-  if (!validateCheckoutForm()) return;
-
-  const phone = document.getElementById("clientPhone").value.trim().replace(/\D/g, "");
-  const pendingRequest = getRetryablePendingOrderRequest(phone, cart);
-
-  if (pendingRequest) {
+  const pendingRequest = readPendingOrderRequest();
+  if (pendingRequest && getPendingOrderPayload(pendingRequest)) {
     submitOrder({ pendingRequest });
     return;
   }
+  if (pendingRequest) {
+    showToast("Сохранённую отправку не удалось прочитать. Не создавайте заказ заново — проверьте его у продавца.");
+    return;
+  }
+  if (!validateCheckoutForm()) return;
+
+  const phone = document.getElementById("clientPhone").value.trim().replace(/\D/g, "");
 
   orderSending = true;
 
@@ -2429,6 +2578,22 @@ let orderLabel = "";
 
 let orderSending = false;
 
+document.getElementById("removeUnavailableOrderItems")?.addEventListener("click", () => {
+  if (orderSending || readPendingOrderRequest()) return;
+  const ids = new Set(rejectedOrderItems.map((item) => String(item.id)));
+  const removed = cart
+    .filter((item) => ids.has(String(item.id)))
+    .map((item) => String(item.title || item.id));
+  cart = cart.filter((item) => !ids.has(String(item.id)));
+  rememberCartRemovals(removed);
+  updateCart();
+  rejectedOrderItems = [];
+  document.getElementById("removeUnavailableOrderItems").hidden = true;
+  checkoutModal.style.display = "none";
+  cartModal.style.display = "flex";
+  lockBody();
+});
+
 function resetCheckoutSubmitButton() {
   const button = document.getElementById("createOrderBtn");
   if (!button) return;
@@ -2437,6 +2602,8 @@ function resetCheckoutSubmitButton() {
   button.disabled = false;
   button.removeAttribute("aria-busy");
   button.textContent = "Создать заказ";
+  const removeButton = document.getElementById("removeUnavailableOrderItems");
+  if (removeButton) removeButton.hidden = true;
 
   const orderSubmitError = document.getElementById("orderSubmitError");
   if (orderSubmitError) {
@@ -2448,6 +2615,30 @@ function resetCheckoutSubmitButton() {
 function prepareCheckoutForOpen() {
   if (!orderSending) resetCheckoutSubmitButton();
   if (!foundClient) setCheckoutIdentityFieldsVisible(true);
+  if (!orderSending && rejectedOrderItems.length) {
+    const status = document.getElementById("orderSubmitError");
+    const removeButton = document.getElementById("removeUnavailableOrderItems");
+    if (status) {
+      status.textContent = "Заказ не записан. Недоступны: " +
+        rejectedOrderItems.map((item) => item.title || item.id).join(", ") +
+        ". Удалите недоступное и проверьте состав.";
+      status.hidden = false;
+    }
+    if (removeButton) removeButton.hidden = false;
+  }
+  if (!orderSending && readPendingOrderRequest()) {
+    const button = document.getElementById("createOrderBtn");
+    const status = document.getElementById("orderSubmitError");
+    const pending = getPendingOrderPayload(readPendingOrderRequest());
+    if (button) button.textContent = "Проверить отправку";
+    if (status) {
+      status.textContent = "Есть неподтверждённая отправка" +
+        (pending ? " для «" + pending.name + "»" +
+          (pending.selectedOrderId ? " в заказ " + pending.selectedOrderId : "") : "") +
+        ". Кнопка проверит прежнюю отправку без создания дубля.";
+      status.hidden = false;
+    }
+  }
 }
 
 function resetCheckoutAfterSuccessfulOrder() {
@@ -4392,7 +4583,7 @@ if (pendingSheetData) {
 
 if ('serviceWorker' in navigator) {
   window.addEventListener('load', () => {
-    navigator.serviceWorker.register("./sw.js?v=115");
+    navigator.serviceWorker.register("./sw.js?v=119");
   });
 }
 
