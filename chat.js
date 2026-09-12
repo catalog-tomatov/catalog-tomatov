@@ -10,6 +10,7 @@
   const CHAT_POLL_FAST_WINDOW = 60000;
   const CHAT_PUSH_SNOOZE_KEY = "tomatoChatPushSnoozedUntil";
   const CHAT_PUSH_SNOOZE_MS = 7 * 24 * 60 * 60 * 1000;
+  const CUSTOMER_PUSH_API_BASE = "https://pult-sezona.asahi-higashi.chatgpt.site/api/push/customer";
 
   const CHAT_SELLER_DELAY = 6000;
 
@@ -470,18 +471,42 @@ const dbDelete = (store, key) =>
   }
 
   async function relayPushRequest(body, timeout = 30000) {
-    const result = await fetchJsonWithTimeout(CATALOG_API_URL, {
-      method: "POST",
-      body: JSON.stringify(body),
-      cache: "no-store",
-    }, timeout);
-    if (!result || result.success !== true) {
-      const error = new Error("Сервис уведомлений временно недоступен.");
-      error.code = result?.error || "PUSH_RELAY_UNAVAILABLE";
-      error.httpStatus = Number(result?.httpStatus) || 0;
+    const action = String(body?.action || "");
+    const route = action === "pushConfig" ? "config"
+      : action === "pushSubscribe" ? "subscribe" : "";
+    if (!route) throw new Error("Некорректный запрос уведомлений.");
+    const controller = new AbortController();
+    const timeoutId = window.setTimeout(() => controller.abort(), timeout);
+    try {
+      const { action: _action, ...payload } = body;
+      const response = await fetch(`${CUSTOMER_PUSH_API_BASE}/${route}`, {
+        method: route === "config" ? "GET" : "POST",
+        headers: route === "config" ? undefined : { "Content-Type": "application/json" },
+        body: route === "config" ? undefined : JSON.stringify(payload),
+        cache: "no-store",
+        signal: controller.signal,
+      });
+      const result = await response.json().catch(() => null);
+      const accepted = route === "config"
+        ? Boolean(result?.publicKey)
+        : result?.success === true;
+      if (!response.ok || !accepted) {
+        const error = new Error("Сервис уведомлений временно недоступен.");
+        error.code = result?.error || "PUSH_RELAY_UNAVAILABLE";
+        error.httpStatus = response.status;
+        throw error;
+      }
+      return result;
+    } catch (error) {
+      if (error?.name === "AbortError") {
+        const timeoutError = new Error("Сервис уведомлений отвечает слишком долго.");
+        timeoutError.code = "REQUEST_TIMEOUT";
+        throw timeoutError;
+      }
       throw error;
+    } finally {
+      window.clearTimeout(timeoutId);
     }
-    return result;
   }
 
   async function getChatPushSubscription() {
@@ -556,7 +581,11 @@ const dbDelete = (store, key) =>
               state.pushSyncDeniedAt.set(successKey, Date.now());
               continue;
             }
-            throw error;
+            // A temporary failure for one saved order must not cancel the
+            // remaining valid subscriptions. It has no success timestamp and
+            // will be retried on the next normal sync.
+            console.warn(`Push-подписка заказа ${orderId} отложена`, error);
+            continue;
           }
         }
       } while (state.pushPendingAccess.size > 0);
@@ -1390,6 +1419,49 @@ async function removeOutboxRequest(
     return request;
   }
 
+  function hasConfirmedOrderStatus(summary) {
+    return Boolean(
+      summary
+      && !summary.statusUnavailable
+      && ["unpaid", "debt", "paid", "issued"].includes(String(summary.status || ""))
+    );
+  }
+
+  async function preserveOrMarkUnavailableSummary(order) {
+    const orderId = normalizeOrderId(order?.orderId);
+    if (!orderId) return;
+
+    const current = state.summaries.get(orderId) || null;
+    if (hasConfirmedOrderStatus(current)) return;
+
+    const cached = await readCachedChat(orderId).catch(() => null);
+    const cachedSummary = cached?.summary || null;
+    if (hasConfirmedOrderStatus(cachedSummary)) {
+      const corrected = applyLatestKnownOrderStatus({ summary: cachedSummary }, orderId);
+      state.summaries.set(orderId, {
+        ...corrected.summary,
+        statusUnavailable: false,
+      });
+      return;
+    }
+
+    const unavailable = {
+      ...(current || cachedSummary || {}),
+      orderId,
+      chatCreated: Boolean(current?.chatCreated || cachedSummary?.chatCreated),
+      isActive: Boolean(current?.isActive || cachedSummary?.isActive),
+      unread: Number(current?.unread ?? cachedSummary?.unread) || 0,
+      lastMessage: String(current?.lastMessage || cachedSummary?.lastMessage || ""),
+      lastAt: String(current?.lastAt || cachedSummary?.lastAt || ""),
+      statusUnavailable: true,
+    };
+    const corrected = applyLatestKnownOrderStatus({ summary: unavailable }, orderId);
+    if (hasConfirmedOrderStatus(corrected.summary)) {
+      corrected.summary.statusUnavailable = false;
+    }
+    state.summaries.set(orderId, corrected.summary);
+  }
+
   async function refreshChatSummariesNow() {
     const refreshSequence = ++state.summaryRefreshSequence;
     if (!state.config || state.config.seasonClosed || !savedOrders.length) {
@@ -1410,9 +1482,12 @@ async function removeOutboxRequest(
     try {
       const result = await apiPost({ action: "chat_summaries", orders: entries }, 30000);
       if (refreshSequence !== state.summaryRefreshSequence) return;
-      result.summaries.forEach((item) => {
+      const returnedSummaries = Array.isArray(result?.summaries) ? result.summaries : [];
+      const returnedOrderIds = new Set();
+      returnedSummaries.forEach((item) => {
         const key = normalizeOrderId(item.order?.orderId || item.summary?.orderId);
         if (!key) return;
+        returnedOrderIds.add(key);
         item.summary = suppressReadSummary(key, item.summary);
 
         // chat_summaries — подтверждённое состояние из Google Sheets.
@@ -1427,7 +1502,7 @@ async function removeOutboxRequest(
 
         updateSavedOrderFromSnapshot(key, item.order, result.seasonId);
       });
-      await Promise.all(result.summaries.map(async (item) => {
+      await Promise.all(returnedSummaries.map(async (item) => {
         const itemOrderId = item.order?.orderId || item.summary?.orderId;
         const cached = await readCachedChat(itemOrderId);
         await cacheChat(itemOrderId, {
@@ -1445,18 +1520,18 @@ async function removeOutboxRequest(
           });
         }
       }));
+      await Promise.all(savedOrders.map((order) => (
+        returnedOrderIds.has(normalizeOrderId(order.orderId))
+          ? null
+          : preserveOrMarkUnavailableSummary(order)
+      )));
     } catch (error) {
       if (refreshSequence !== state.summaryRefreshSequence) return;
       if (error?.code !== "REQUEST_TIMEOUT") {
         console.warn("Не удалось обновить сводки чата", error);
       }
       for (const order of savedOrders) {
-        const cached = await readCachedChat(order.orderId);
-        if (cached?.summary) {
-          const normalized = normalizeOrderId(order.orderId);
-          const corrected = applyLatestKnownOrderStatus(cached, normalized);
-          state.summaries.set(normalized, corrected?.summary || cached.summary);
-        }
+        await preserveOrMarkUnavailableSummary(order);
       }
     }
     updateAppBadge();
@@ -1594,8 +1669,12 @@ async function removeOutboxRequest(
     const orderId = normalizeOrderId(order.orderId);
     const summary = state.summaries.get(orderId) || null;
     const status = card.querySelector(".saved-order-card-status") || document.createElement("strong");
-    status.className = `saved-order-card-status ${statusClass(effectiveOrderStatus(summary))}`;
-    status.textContent = summary ? effectiveOrderStatusLabel(summary) : "СТАТУС ОБНОВЛЯЕТСЯ";
+    status.className = summary?.statusUnavailable
+      ? "saved-order-card-status"
+      : `saved-order-card-status ${statusClass(effectiveOrderStatus(summary))}`;
+    status.textContent = summary?.statusUnavailable
+      ? "СТАТУС НЕДОСТУПЕН"
+      : summary ? effectiveOrderStatusLabel(summary) : "СТАТУС ОБНОВЛЯЕТСЯ";
     if (!card.contains(status)) card.appendChild(status);
 
     const chatButton = document.createElement("button");
